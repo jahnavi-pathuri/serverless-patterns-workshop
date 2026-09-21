@@ -1,0 +1,8 @@
+[
+  {
+    "EventBusName": "Orders-dev",
+    "Source": "restaurant",
+    "DetailType": "order.updated",
+    "Detail": "{\"data\": {\"userId\": \"847824c8-00a1-7060-e6cb-9c8542482007\", \"orderId\": \"O2\", \"status\": \"IN-PROCESS\"}}"
+  }
+]
