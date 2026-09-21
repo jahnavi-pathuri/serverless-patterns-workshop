@@ -1,0 +1,406 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  SAM Template for Module 4 (user profiles) - asynchronous invocation
+
+Parameters:
+  UserPoolId:
+    Type: String
+    Description: Cognito User Pool ID from the Module 2 users stack
+
+Globals:
+  Function:
+    Runtime: python3.13
+    CodeUri: src/api/
+    MemorySize: 128
+    Timeout: 30
+    Tracing: Active
+
+Resources:
+  # ---------- Data stores ----------
+  AddressTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-Addresses
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: address_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+        - AttributeName: address_id
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+
+  FavoritesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub ${AWS::StackName}-Favorites
+      AttributeDefinitions:
+        - AttributeName: user_id
+          AttributeType: S
+        - AttributeName: restaurant_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: user_id
+          KeyType: HASH
+        - AttributeName: restaurant_id
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+
+  # ---------- Asynchronous channels ----------
+  AddressBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub ${AWS::StackName}-AddressBus
+
+  FavoritesQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      VisibilityTimeout: 60
+
+  # ---------- Address workers (triggered by EventBridge) ----------
+  AddUserAddressFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: add_user_address.lambda_handler
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref AddressTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AddressTable
+      Events:
+        AddressAdded:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref AddressBus
+            Pattern:
+              source:
+                - customer-profile
+              detail-type:
+                - address.added
+
+  EditUserAddressFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: edit_user_address.lambda_handler
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref AddressTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AddressTable
+      Events:
+        AddressUpdated:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref AddressBus
+            Pattern:
+              source:
+                - customer-profile
+              detail-type:
+                - address.updated
+
+  DeleteUserAddressFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: delete_user_address.lambda_handler
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref AddressTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref AddressTable
+      Events:
+        AddressDeleted:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref AddressBus
+            Pattern:
+              source:
+                - customer-profile
+              detail-type:
+                - address.deleted
+
+  # ---------- Favorites worker (triggered by SQS) ----------
+  ProcessFavoritesQueueFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: process_favorites_queue.lambda_handler
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref FavoritesTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FavoritesTable
+      Events:
+        FavoritesQueueEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt FavoritesQueue.Arn
+            BatchSize: 10
+
+  # ---------- Synchronous readers ----------
+  ReadUserAddressesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: read_user_addresses.lambda_handler
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref AddressTable
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref AddressTable
+
+  ReadUserFavoritesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: read_user_favorites.lambda_handler
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref FavoritesTable
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref FavoritesTable
+
+  ReadAddressesPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ReadUserAddressesFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserProfileApi}/*
+
+  ReadFavoritesPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref ReadUserFavoritesFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${UserProfileApi}/*
+
+  # ---------- Lets API Gateway write to EventBridge and SQS ----------
+  ApiIntegrationRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ApiToEventBridgeAndSqs
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !GetAtt AddressBus.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt FavoritesQueue.Arn
+
+  # ---------- The API ----------
+  UserProfileApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      TracingEnabled: true
+      DefinitionBody:
+        swagger: "2.0"
+        info:
+          title: !Sub ${AWS::StackName}-api
+          version: "1.0"
+        securityDefinitions:
+          CognitoAuthorizer:
+            type: apiKey
+            name: Authorization
+            in: header
+            x-amazon-apigateway-authtype: cognito_user_pools
+            x-amazon-apigateway-authorizer:
+              type: cognito_user_pools
+              providerARNs:
+                - !Sub arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/${UserPoolId}
+        paths:
+          /addresses:
+            get:
+              security:
+                - CognitoAuthorizer: []
+              responses:
+                "200":
+                  description: OK
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ReadUserAddressesFunction.Arn}/invocations
+            post:
+              security:
+                - CognitoAuthorizer: []
+              responses:
+                "200":
+                  description: OK
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                credentials: !GetAtt ApiIntegrationRole.Arn
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:events:action/PutEvents
+                passthroughBehavior: when_no_templates
+                requestParameters:
+                  integration.request.header.X-Amz-Target: "'AWSEvents.PutEvents'"
+                  integration.request.header.Content-Type: "'application/x-amz-json-1.1'"
+                requestTemplates:
+                  application/json: !Sub |
+                    #set($inputRoot = $input.path('$'))
+                    {
+                      "Entries": [
+                        {
+                          "Source": "customer-profile",
+                          "DetailType": "address.added",
+                          "EventBusName": "${AddressBus}",
+                          "Detail": "{\"userId\":\"$context.authorizer.claims.sub\",\"line1\":\"$inputRoot.line1\",\"line2\":\"$inputRoot.line2\",\"city\":\"$inputRoot.city\",\"stateProvince\":\"$inputRoot.stateProvince\",\"postal\":\"$inputRoot.postal\"}"
+                        }
+                      ]
+                    }
+                responses:
+                  default:
+                    statusCode: "200"
+          /addresses/{addressId}:
+            parameters:
+              - name: addressId
+                in: path
+                required: true
+                type: string
+            put:
+              security:
+                - CognitoAuthorizer: []
+              responses:
+                "200":
+                  description: OK
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                credentials: !GetAtt ApiIntegrationRole.Arn
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:events:action/PutEvents
+                passthroughBehavior: when_no_templates
+                requestParameters:
+                  integration.request.header.X-Amz-Target: "'AWSEvents.PutEvents'"
+                  integration.request.header.Content-Type: "'application/x-amz-json-1.1'"
+                requestTemplates:
+                  application/json: !Sub |
+                    #set($inputRoot = $input.path('$'))
+                    {
+                      "Entries": [
+                        {
+                          "Source": "customer-profile",
+                          "DetailType": "address.updated",
+                          "EventBusName": "${AddressBus}",
+                          "Detail": "{\"userId\":\"$context.authorizer.claims.sub\",\"addressId\":\"$input.params('addressId')\",\"line1\":\"$inputRoot.line1\",\"line2\":\"$inputRoot.line2\",\"city\":\"$inputRoot.city\",\"stateProvince\":\"$inputRoot.stateProvince\",\"postal\":\"$inputRoot.postal\"}"
+                        }
+                      ]
+                    }
+                responses:
+                  default:
+                    statusCode: "200"
+            delete:
+              security:
+                - CognitoAuthorizer: []
+              responses:
+                "200":
+                  description: OK
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                credentials: !GetAtt ApiIntegrationRole.Arn
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:events:action/PutEvents
+                passthroughBehavior: when_no_templates
+                requestParameters:
+                  integration.request.header.X-Amz-Target: "'AWSEvents.PutEvents'"
+                  integration.request.header.Content-Type: "'application/x-amz-json-1.1'"
+                requestTemplates:
+                  application/json: !Sub |
+                    {
+                      "Entries": [
+                        {
+                          "Source": "customer-profile",
+                          "DetailType": "address.deleted",
+                          "EventBusName": "${AddressBus}",
+                          "Detail": "{\"userId\":\"$context.authorizer.claims.sub\",\"addressId\":\"$input.params('addressId')\"}"
+                        }
+                      ]
+                    }
+                responses:
+                  default:
+                    statusCode: "200"
+          /favorites:
+            get:
+              security:
+                - CognitoAuthorizer: []
+              responses:
+                "200":
+                  description: OK
+              x-amazon-apigateway-integration:
+                type: aws_proxy
+                httpMethod: POST
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ReadUserFavoritesFunction.Arn}/invocations
+          /favorites/{restaurantId}:
+            parameters:
+              - name: restaurantId
+                in: path
+                required: true
+                type: string
+            post:
+              security:
+                - CognitoAuthorizer: []
+              responses:
+                "200":
+                  description: OK
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                credentials: !GetAtt ApiIntegrationRole.Arn
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:sqs:path/${AWS::AccountId}/${FavoritesQueue.QueueName}
+                passthroughBehavior: when_no_templates
+                requestParameters:
+                  integration.request.header.Content-Type: "'application/x-www-form-urlencoded'"
+                requestTemplates:
+                  application/json: "Action=SendMessage&MessageBody=$input.params('restaurantId')&MessageAttribute.1.Name=UserId&MessageAttribute.1.Value.StringValue=$context.authorizer.claims.sub&MessageAttribute.1.Value.DataType=String&MessageAttribute.2.Name=CommandName&MessageAttribute.2.Value.StringValue=AddFavorite&MessageAttribute.2.Value.DataType=String"
+                responses:
+                  default:
+                    statusCode: "200"
+            delete:
+              security:
+                - CognitoAuthorizer: []
+              responses:
+                "200":
+                  description: OK
+              x-amazon-apigateway-integration:
+                type: aws
+                httpMethod: POST
+                credentials: !GetAtt ApiIntegrationRole.Arn
+                uri: !Sub arn:aws:apigateway:${AWS::Region}:sqs:path/${AWS::AccountId}/${FavoritesQueue.QueueName}
+                passthroughBehavior: when_no_templates
+                requestParameters:
+                  integration.request.header.Content-Type: "'application/x-www-form-urlencoded'"
+                requestTemplates:
+                  application/json: "Action=SendMessage&MessageBody=$input.params('restaurantId')&MessageAttribute.1.Name=UserId&MessageAttribute.1.Value.StringValue=$context.authorizer.claims.sub&MessageAttribute.1.Value.DataType=String&MessageAttribute.2.Name=CommandName&MessageAttribute.2.Value.StringValue=DeleteFavorite&MessageAttribute.2.Value.DataType=String"
+                responses:
+                  default:
+                    statusCode: "200"
+
+Outputs:
+  ApiEndpoint:
+    Description: User profile API endpoint
+    Value: !Sub "https://${UserProfileApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
+  AddressTable:
+    Value: !Ref AddressTable
+  FavoritesTable:
+    Value: !Ref FavoritesTable
+  AddressBus:
+    Value: !Ref AddressBus
+  FavoritesQueue:
+    Value: !Ref FavoritesQueue
