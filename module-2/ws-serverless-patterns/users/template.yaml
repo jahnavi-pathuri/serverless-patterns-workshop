@@ -87,6 +87,14 @@ Resources:
     Properties:
       StageName: Prod
       TracingEnabled: true
+            Auth:
+        DefaultAuthorizer: LambdaTokenAuthorizer
+        Authorizers:
+          LambdaTokenAuthorizer:
+            FunctionArn: !GetAtt AuthorizerFunction.Arn
+            Identity:
+              Headers:
+                - Authorization
       Tags:
         Name: !Sub "${AWS::StackName}-API"
         Stack: !Sub "${AWS::StackName}"
@@ -149,6 +157,18 @@ Resources:
       GroupName: !Ref UserPoolAdminGroupName
       Precedence: 0
       UserPoolId: !Ref UserPool
+    AuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/api/authorizer.lambda_handler
+      Description: Handler for Lambda authorizer
+      Environment:
+        Variables:
+          USER_POOL_ID: !Ref UserPool
+          APPLICATION_CLIENT_ID: !Ref UserPoolClient
+          ADMIN_GROUP_NAME: !Ref UserPoolAdminGroupName
+      Tags:
+        Stack: !Sub "${AWS::StackName}"
 
 Outputs:
   UsersTable:
